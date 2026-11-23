@@ -1,14 +1,17 @@
 """
 cuda_int2_group_ops.py
-Standalone PyTorch wrapper and JIT loader for Stage 2: Asymmetric Per-Group INT2 Quantization:
+Standalone PyTorch wrapper, Int2GroupLinear module, and JIT loader for Stage 2/3:
+Asymmetric Per-Group INT2 Quantization:
 - pack_int2_group_weight: Vectorized group-wise asymmetric INT2 packing with fast MSE clipping grid search
 - unpack_int2_group_weight: Reference PyTorch dequantizer to FP32
-- unpack_int2_group_gemv: High-performance sm_86 CUDA register-unpacking GEMV kernel wrapper
+- unpack_int2_group_gemv: High-performance sm_86 CUDA register-unpacking GEMV/GEMM kernel wrapper
+- Int2GroupLinear: Drop-in nn.Module for Qwen3-8B transformer layers
 """
 
 import os
 import torch
-from typing import Tuple
+import torch.nn as nn
+from typing import Tuple, Optional
 from torch.utils.cpp_extension import load
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,12 +54,6 @@ def pack_int2_group_weight(
       W_packed:    [N, K // 16] (int32)
       scales:      [N, K // group_size] (float16)
       zero_points: [N, K // group_size] (float16)
-
-    Asymmetric Per-Group INT2 Specification:
-    - Weight reconstruction: w_hat = scale * q + zero_point, where q in {0, 1, 2, 3}.
-    - Fast MSE clipping loop: tests clip ratios from 0.75 to 1.00 of group min/max
-      to prevent outlier weights from collapsing the resolution of inlier weights.
-    - 16 2-bit codes packed into each uint32 word.
     """
     assert W.dim() == 2, f"Expected 2D weight matrix, got shape {W.shape}"
     N, K = W.shape
@@ -79,7 +76,6 @@ def pack_int2_group_weight(
     clip_ratios = torch.linspace(0.75, 1.0, num_clip_steps, device=W.device, dtype=torch.float32)
 
     for alpha in clip_ratios:
-        # Symmetric range shrinkage around zero
         c_min = w_min * alpha
         c_max = w_max * alpha
         scale = torch.clamp((c_max - c_min) / 3.0, min=1e-5)
@@ -132,7 +128,6 @@ def unpack_int2_group_weight(
     codes = ((packed_i64.unsqueeze(-1) >> shifts) & 0x3).view(N, K).to(torch.float32)
 
     # Expand scales and zero_points from [N, num_groups] to [N, K]
-    num_groups = K // group_size
     scales_f32 = scales.to(torch.float32).unsqueeze(-1).repeat(1, 1, group_size).view(N, K)
     zp_f32 = zero_points.to(torch.float32).unsqueeze(-1).repeat(1, 1, group_size).view(N, K)
 
@@ -147,21 +142,79 @@ def unpack_int2_group_gemv(
     group_size: int = 32,
 ) -> torch.Tensor:
     """
-    Executes single-token decode GEMV (M == 1) with per-group scales and zero points.
-    Uses sm_86 warp-per-row register-level bit unpacking with FP32 accumulators.
-
-    Args:
-        x: [K] or [1, K] in float16 (CUDA)
-        W_packed: [N, K // 16] in int32 (CUDA)
-        scales: [N, K // group_size] in float16 (CUDA)
-        zero_points: [N, K // group_size] in float16 (CUDA)
-        group_size: 16 or 32
-
-    Returns:
-        Y: [N] or [1, N] in float16 (CUDA)
+    Executes decode or prefill GEMV/GEMM with per-group scales and zero points.
+    Supports 1D [K], 2D [B, K], or 3D [B, S, K] inputs.
     """
     ext = get_cuda_int2_group_ext()
     x_fp16 = x if x.dtype == torch.float16 else x.to(torch.float16)
     scales_fp16 = scales if scales.dtype == torch.float16 else scales.to(torch.float16)
     zp_fp16 = zero_points if zero_points.dtype == torch.float16 else zero_points.to(torch.float16)
     return ext.packed_int2_group_gemv_cuda(x_fp16, W_packed, scales_fp16, zp_fp16, group_size)
+
+
+class Int2GroupLinear(nn.Module):
+    """
+    Drop-in replacement for nn.Linear using Stage 2 Asymmetric INT2 Quantization.
+    Stores:
+      - W_packed: [out_features, in_features // 16] (int32)
+      - scales: [out_features, in_features // group_size] (float16)
+      - zero_points: [out_features, in_features // group_size] (float16)
+      - bias: [out_features] (optional float16)
+    """
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        group_size: int = 32,
+        bias: bool = False,
+        device: str = "cuda",
+    ):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        self.has_bias = bias
+
+        num_words = in_features // 16
+        num_groups = in_features // group_size
+
+        self.register_buffer("W_packed", torch.empty((out_features, num_words), dtype=torch.int32, device=device))
+        self.register_buffer("scales", torch.empty((out_features, num_groups), dtype=torch.float16, device=device))
+        self.register_buffer("zero_points", torch.empty((out_features, num_groups), dtype=torch.float16, device=device))
+        if bias:
+            self.register_buffer("bias", torch.empty((out_features,), dtype=torch.float16, device=device))
+        else:
+            self.bias = None
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear: nn.Linear,
+        group_size: int = 32,
+        device: str = "cuda",
+    ) -> "Int2GroupLinear":
+        """Constructs and quantizes an Int2GroupLinear directly from an existing nn.Linear."""
+        in_f = linear.in_features
+        out_f = linear.out_features
+        has_b = linear.bias is not None
+
+        layer = cls(in_f, out_f, group_size=group_size, bias=has_b, device=device)
+        w = linear.weight.data.to(device)
+        packed, s, z = pack_int2_group_weight(w, group_size=group_size)
+        layer.W_packed.copy_(packed)
+        layer.scales.copy_(s)
+        layer.zero_points.copy_(z)
+
+        if has_b:
+            layer.bias.copy_(linear.bias.data.to(device=device, dtype=torch.float16))
+
+        return layer
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = unpack_int2_group_gemv(x, self.W_packed, self.scales, self.zero_points, self.group_size)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, group_size={self.group_size}, bias={self.has_bias}"

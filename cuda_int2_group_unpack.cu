@@ -6,12 +6,13 @@
 // CUDA Kernel: packed_int2_group_gemv_fp16_kernel
 //
 // Optimized for sm_86 architecture (RTX 3050 Ti):
-// - Single-token decode (M == 1): computes Y = X @ W.T
+// - Supports both single-token decode (B == 1) and prompt prefill (B > 1):
+//     Computes Y[b, :] = X[b, :] @ W.T
 // - Asymmetric per-group FP16 scale and zero_point:
 //     W_hat[i, j] = scale[i, g] * q[i, j] + zero_point[i, g]
 // - Block structure: 256 threads = 8 warps of 32 threads.
-// - Grid: gridDim.x = (out_features + 7) / 8 blocks.
-// - Each 32-thread warp independently computes 1 output row (out_features).
+// - Grid: gridDim.x = (out_features + 7) / 8, gridDim.y = B.
+// - Each 32-thread warp independently computes 1 output row for 1 batch token.
 // - Shared memory tile: GEMV_TILE_COLS = 1024 half elements (2048 bytes).
 // - In INT2, each uint32 holds 16 weights (2 bits each: q in {0, 1, 2, 3}).
 // - In 1024 columns, there are 1024 / 16 = 64 uint32 words per row.
@@ -27,19 +28,26 @@
 
 template <int GROUP_SIZE>
 __global__ void packed_int2_group_gemv_fp16_kernel(
-    const __half*   __restrict__ X,            // [orig_cols]
+    const __half*   __restrict__ X,            // [B, orig_cols]
     const uint32_t* __restrict__ W_packed,     // [out_features, words_per_row]
     const __half*   __restrict__ scales,       // [out_features, num_groups]
     const __half*   __restrict__ zero_points,  // [out_features, num_groups]
-    __half*         __restrict__ Y,            // [out_features]
+    __half*         __restrict__ Y,            // [B, out_features]
+    int B,
     int orig_cols,
     int out_features,
     int words_per_row,
     int num_groups
 ) {
+    int b_idx = blockIdx.y;
+    if (b_idx >= B) return;
+
     int warp_id = threadIdx.x / 32;          // 0..7
     int lane_id = threadIdx.x % 32;          // 0..31
     int row_idx = blockIdx.x * 8 + warp_id;  // Global output row index
+
+    const __half* x_row = X + (size_t)b_idx * orig_cols;
+    __half*       y_row = Y + (size_t)b_idx * out_features;
 
     const uint32_t* w_row = (row_idx < out_features)
         ? (W_packed + (size_t)row_idx * words_per_row)
@@ -65,7 +73,7 @@ __global__ void packed_int2_group_gemv_fp16_kernel(
         for (int i = 0; i < 4; i++) {
             int col_offset = threadIdx.x + i * 256;
             int global_col = tile_col_start + col_offset;
-            smem_x[col_offset] = (global_col < orig_cols) ? X[global_col] : __float2half(0.0f);
+            smem_x[col_offset] = (global_col < orig_cols) ? x_row[global_col] : __float2half(0.0f);
         }
 
         __syncthreads();
@@ -82,11 +90,9 @@ __global__ void packed_int2_group_gemv_fp16_kernel(
             // Group indices
             int g0, g1;
             if constexpr (GROUP_SIZE == 16) {
-                // 16 weights per uint32 -> 1 word per group
                 g0 = word_idx0;
                 g1 = word_idx1;
             } else if constexpr (GROUP_SIZE == 32) {
-                // 32 weights per group -> 2 words per group
                 g0 = word_idx0 >> 1;
                 g1 = word_idx1 >> 1;
             } else {
@@ -131,9 +137,9 @@ __global__ void packed_int2_group_gemv_fp16_kernel(
         acc += __shfl_down_sync(0xffffffff, acc, offset);
     }
 
-    // Lane 0 of each warp writes accumulated result to Y
+    // Lane 0 of each warp writes accumulated result to y_row
     if (lane_id == 0 && row_idx < out_features) {
-        Y[row_idx] = __float2half(acc);
+        y_row[row_idx] = __float2half(acc);
     }
 }
 
@@ -148,6 +154,7 @@ void launch_packed_int2_group_gemv_fp16(
     const __half*   scales,
     const __half*   zero_points,
     __half*         Y,
+    int B,
     int orig_cols,
     int out_features,
     int words_per_row,
@@ -156,21 +163,21 @@ void launch_packed_int2_group_gemv_fp16(
 ) {
     int threads_per_block = 256; // 8 warps
     int warps_per_block = 8;
-    int blocks = (out_features + warps_per_block - 1) / warps_per_block;
+    int blocks_x = (out_features + warps_per_block - 1) / warps_per_block;
+    dim3 grid(blocks_x, B);
     int num_groups = (orig_cols + group_size - 1) / group_size;
 
     if (group_size == 16) {
-        packed_int2_group_gemv_fp16_kernel<16><<<blocks, threads_per_block, 0, stream>>>(
-            X, W_packed, scales, zero_points, Y, orig_cols, out_features, words_per_row, num_groups
+        packed_int2_group_gemv_fp16_kernel<16><<<grid, threads_per_block, 0, stream>>>(
+            X, W_packed, scales, zero_points, Y, B, orig_cols, out_features, words_per_row, num_groups
         );
     } else if (group_size == 32) {
-        packed_int2_group_gemv_fp16_kernel<32><<<blocks, threads_per_block, 0, stream>>>(
-            X, W_packed, scales, zero_points, Y, orig_cols, out_features, words_per_row, num_groups
+        packed_int2_group_gemv_fp16_kernel<32><<<grid, threads_per_block, 0, stream>>>(
+            X, W_packed, scales, zero_points, Y, B, orig_cols, out_features, words_per_row, num_groups
         );
     } else {
-        // Fallback generic
-        packed_int2_group_gemv_fp16_kernel<0><<<blocks, threads_per_block, 0, stream>>>(
-            X, W_packed, scales, zero_points, Y, orig_cols, out_features, words_per_row, num_groups
+        packed_int2_group_gemv_fp16_kernel<0><<<grid, threads_per_block, 0, stream>>>(
+            X, W_packed, scales, zero_points, Y, B, orig_cols, out_features, words_per_row, num_groups
         );
     }
 }

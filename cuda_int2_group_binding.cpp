@@ -11,6 +11,7 @@ void launch_packed_int2_group_gemv_fp16(
     const __half*   scales,
     const __half*   zero_points,
     __half*         Y,
+    int B,
     int orig_cols,
     int out_features,
     int words_per_row,
@@ -20,7 +21,7 @@ void launch_packed_int2_group_gemv_fp16(
 }
 
 torch::Tensor packed_int2_group_gemv_cuda(
-    torch::Tensor x,             // [K] or [1, K] (FP16)
+    torch::Tensor x,             // [..., K] (FP16)
     torch::Tensor w_packed,      // [N, K / 16] (int32)
     torch::Tensor scales,        // [N, num_groups] (FP16)
     torch::Tensor zero_points,   // [N, num_groups] (FP16)
@@ -35,28 +36,28 @@ torch::Tensor packed_int2_group_gemv_cuda(
     TORCH_CHECK(zero_points.scalar_type() == torch::kFloat16, "zero_points must be float16");
     TORCH_CHECK(w_packed.scalar_type() == torch::kInt32, "w_packed must be int32");
 
+    int orig_cols = w_packed.size(1) * 16;
+    int out_features = w_packed.size(0);
+    int words_per_row = w_packed.size(1);
+
+    int64_t total_tokens = x.numel() / orig_cols;
+    TORCH_CHECK(x.numel() == total_tokens * orig_cols, "x inner dimension must match weight columns");
+
     auto x_contig = x.contiguous();
     auto w_contig = w_packed.contiguous();
     auto s_contig = scales.contiguous();
     auto z_contig = zero_points.contiguous();
 
-    int orig_cols = x_contig.numel();
-    int out_features = w_contig.size(0);
-    int words_per_row = w_contig.size(1);
-
-    TORCH_CHECK(orig_cols == words_per_row * 16, "orig_cols must equal words_per_row * 16");
-
     int expected_groups = (orig_cols + group_size - 1) / group_size;
     TORCH_CHECK(s_contig.size(1) == expected_groups, "scales num_groups mismatch");
     TORCH_CHECK(z_contig.size(1) == expected_groups, "zero_points num_groups mismatch");
 
+    auto orig_shape = x.sizes().vec();
+    std::vector<int64_t> out_shape = orig_shape;
+    out_shape.back() = out_features;
+
     auto options = torch::TensorOptions().dtype(torch::kFloat16).device(x.device());
-    torch::Tensor y;
-    if (x.dim() == 2) {
-        y = torch::empty({1, out_features}, options);
-    } else {
-        y = torch::empty({out_features}, options);
-    }
+    torch::Tensor y = torch::empty(out_shape, options);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -66,6 +67,7 @@ torch::Tensor packed_int2_group_gemv_cuda(
         reinterpret_cast<const __half*>(s_contig.data_ptr<at::Half>()),
         reinterpret_cast<const __half*>(z_contig.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(y.data_ptr<at::Half>()),
+        static_cast<int>(total_tokens),
         orig_cols,
         out_features,
         words_per_row,

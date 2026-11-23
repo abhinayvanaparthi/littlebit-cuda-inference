@@ -24,6 +24,7 @@ __pycache__/
 .env
 .hf_cache/
 .cache/
+qwen3-8b-int2-stage2/
 
 # Cloned reference repository
 LittleBit/
