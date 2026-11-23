@@ -1,0 +1,27 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build artifacts & compiled extensions
+build_cuda_unpack/
+build/
+bin/
+__pycache__/
+*.pyc
+*.pyd
+*.obj
+*.o
+*.lib
+*.exp
+*.dll
+*.ninja_log
+.ninja_deps
+
+# Environments and caches
+.env
+.hf_cache/
+.cache/
+
+# Cloned reference repository
+LittleBit/
