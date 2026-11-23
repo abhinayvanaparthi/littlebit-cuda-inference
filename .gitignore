@@ -6,6 +6,7 @@ env/
 # Build artifacts & compiled extensions
 build_cuda_unpack/
 build_cuda_int2/
+build_cuda_int2_group/
 build/
 bin/
 __pycache__/
