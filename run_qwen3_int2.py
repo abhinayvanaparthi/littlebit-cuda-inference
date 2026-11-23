@@ -72,13 +72,36 @@ def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage2", lm_head_cuda
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_config(config)
 
-    # Materialize rotary embedding on CUDA
-    if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
-        rot_cls = type(model.model.rotary_emb)
-        model.model.rotary_emb = rot_cls(config=config).to(CUDA_DEVICE)
+    # Re-instantiate Qwen3RotaryEmbedding directly on CUDA (avoids meta-device uninitialized buffers)
+    try:
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+        rot_cls = Qwen3RotaryEmbedding
+    except ImportError:
+        rot_cls = type(model.model.rotary_emb) if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None else None
+
+    if rot_cls is not None:
+        try:
+            rotary_emb = rot_cls(config=model.config, device=CUDA_DEVICE)
+        except TypeError:
+            try:
+                with torch.device(CUDA_DEVICE):
+                    rotary_emb = rot_cls(config=model.config)
+            except Exception:
+                rotary_emb = rot_cls(config=model.config).to(CUDA_DEVICE)
+        model.model.rotary_emb = rotary_emb
         for layer in model.model.layers:
             if hasattr(layer.self_attn, "rotary_emb"):
-                layer.self_attn.rotary_emb = model.model.rotary_emb
+                layer.self_attn.rotary_emb = rotary_emb
+
+        inv_freq = model.model.rotary_emb.inv_freq
+        assert inv_freq.device.type == torch.device(CUDA_DEVICE).type, f"inv_freq on wrong device: {inv_freq.device}"
+        assert not torch.isnan(inv_freq).any(), "inv_freq contains NaNs!"
+        assert not torch.isinf(inv_freq).any(), "inv_freq contains Infs!"
+        assert (inv_freq[0] > 0.99).item(), f"inv_freq[0] expected > 0.99, got {inv_freq[0].item()}"
+        assert (inv_freq[-1] > 0).item(), f"inv_freq[-1] expected > 0, got {inv_freq[-1].item()}"
+
+        first_3 = [round(float(v), 4) for v in inv_freq[:3].tolist()]
+        print(f"      Materialized Qwen3RotaryEmbedding on {CUDA_DEVICE} (inv_freq[:3] = {first_3}, last = {inv_freq[-1].item():.4e})")
 
     # 2. Replace all 36 layers' linear modules with Int2GroupLinear
     print("[2/4] Replacing linear projections with Int2GroupLinear modules...")
@@ -164,8 +187,8 @@ def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage2", lm_head_cuda
                 elif k == "model.norm.weight":
                     model.model.norm.weight = nn.Parameter(tensor.to(device=CUDA_DEVICE, dtype=torch.float16), requires_grad=False)
 
-    # 4. Zero meta tensor verification & cleanup of any remaining meta buffers
-    print("[4/4] Verifying 0 meta tensors remain across all model components...")
+    # 4. Zero meta tensor verification, tie_word_embeddings check, & wrapper validation
+    print("[4/4] Verifying 0 meta tensors, embeddings/head wrappers, and weight tying...")
 
     for name, buf in list(model.named_buffers()):
         if buf.device.type == "meta":
@@ -186,6 +209,41 @@ def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage2", lm_head_cuda
     meta_buffers = [name for name, b in model.named_buffers() if b.device.type == "meta"]
     assert len(meta_params) == 0, f"Found meta parameters: {meta_params}"
     assert len(meta_buffers) == 0, f"Found meta buffers: {meta_buffers}"
+
+    # Verify tie_word_embeddings=False and separate allocations
+    assert hasattr(model.model, "embed_tokens") and model.model.embed_tokens is not None, "embed_tokens not found!"
+    assert hasattr(model, "lm_head") and model.lm_head is not None, "lm_head not found!"
+
+    embed_w = model.model.embed_tokens.weight
+    head_w = model.lm_head.weight
+    assert embed_w.shape == (config.vocab_size, config.hidden_size), f"embed_tokens shape mismatch: {embed_w.shape} vs ({config.vocab_size}, {config.hidden_size})"
+    assert head_w.shape == (config.vocab_size, config.hidden_size), f"lm_head shape mismatch: {head_w.shape} vs ({config.vocab_size}, {config.hidden_size})"
+
+    tie_word_embeddings = getattr(config, "tie_word_embeddings", False)
+    if not tie_word_embeddings:
+        assert embed_w.data_ptr() != head_w.data_ptr(), "Expected separate embed_tokens and lm_head weights when tie_word_embeddings=False!"
+        print(f"      Verified tie_word_embeddings=False: separate memory pointers ({hex(embed_w.data_ptr())} vs {hex(head_w.data_ptr())})")
+
+    # Verify CPUEmbeddingWrapper output shape, dtype, and target device
+    with torch.no_grad():
+        test_ids = torch.tensor([[1, 2]], dtype=torch.long, device=CUDA_DEVICE)
+        test_embeds = model.model.embed_tokens(test_ids)
+        assert test_embeds.shape == (1, 2, config.hidden_size), f"embed_tokens output shape mismatch: {test_embeds.shape}"
+        assert test_embeds.dtype == torch.float16, f"embed_tokens output dtype mismatch: {test_embeds.dtype}"
+        assert test_embeds.device.type == torch.device(CUDA_DEVICE).type, f"embed_tokens output device mismatch: {test_embeds.device}"
+        print(f"      Verified CPUEmbeddingWrapper: input {tuple(test_ids.shape)} -> output {tuple(test_embeds.shape)} ({test_embeds.dtype}) on {test_embeds.device}")
+
+        # Verify CPUHeadWrapper output shape, dtype, and target device
+        test_hidden = torch.randn(1, 2, config.hidden_size, dtype=torch.float16, device=CUDA_DEVICE)
+        test_logits = model.lm_head(test_hidden)
+        assert test_logits.shape == (1, 2, config.vocab_size), f"lm_head output shape mismatch: {test_logits.shape}"
+        assert test_logits.dtype == torch.float16, f"lm_head output dtype mismatch: {test_logits.dtype}"
+        assert test_logits.device.type == torch.device(CUDA_DEVICE).type, f"lm_head output device mismatch: {test_logits.device}"
+        print(f"      Verified CPUHeadWrapper: input {tuple(test_hidden.shape)} -> output {tuple(test_logits.shape)} ({test_logits.dtype}) on {test_logits.device}")
+
+        del test_ids, test_embeds, test_hidden, test_logits
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     allocated_mb = torch.cuda.memory_allocated() / (1024 ** 2)
     print(f"      Model fully loaded! Total GPU VRAM Allocated: {allocated_mb:.1f} MB ({allocated_mb/1024:.2f} GB / 4.00 GB)")
