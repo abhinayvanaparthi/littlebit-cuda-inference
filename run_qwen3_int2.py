@@ -76,6 +76,9 @@ def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage2", lm_head_cuda
     if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
         rot_cls = type(model.model.rotary_emb)
         model.model.rotary_emb = rot_cls(config=config).to(CUDA_DEVICE)
+        for layer in model.model.layers:
+            if hasattr(layer.self_attn, "rotary_emb"):
+                layer.self_attn.rotary_emb = model.model.rotary_emb
 
     # 2. Replace all 36 layers' linear modules with Int2GroupLinear
     print("[2/4] Replacing linear projections with Int2GroupLinear modules...")
@@ -142,6 +145,14 @@ def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage2", lm_head_cuda
                     else:
                         buf = getattr(proj_mod, buf_name)
                         buf.copy_(tensor.to(device=CUDA_DEVICE))
+                elif "q_norm.weight" in k or "k_norm.weight" in k:
+                    # Attention Q/K RMSNorms (e.g. model.layers.0.self_attn.q_norm.weight)
+                    parts = k.split(".")
+                    layer_idx = int(parts[2])
+                    norm_name = parts[4]
+                    layer = model.model.layers[layer_idx]
+                    norm_mod = getattr(layer.self_attn, norm_name)
+                    norm_mod.weight = nn.Parameter(tensor.to(device=CUDA_DEVICE, dtype=torch.float16), requires_grad=False)
                 elif "input_layernorm" in k or "post_attention_layernorm" in k:
                     # Norm weights
                     parts = k.split(".")
@@ -153,8 +164,24 @@ def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage2", lm_head_cuda
                 elif k == "model.norm.weight":
                     model.model.norm.weight = nn.Parameter(tensor.to(device=CUDA_DEVICE, dtype=torch.float16), requires_grad=False)
 
-    # 4. Zero meta tensor verification
+    # 4. Zero meta tensor verification & cleanup of any remaining meta buffers
     print("[4/4] Verifying 0 meta tensors remain across all model components...")
+
+    for name, buf in list(model.named_buffers()):
+        if buf.device.type == "meta":
+            if "inv_freq" in name and hasattr(model.model, "rotary_emb") and hasattr(model.model.rotary_emb, "inv_freq"):
+                parent_mod = model
+                sub_names = name.split(".")
+                for s in sub_names[:-1]:
+                    parent_mod = getattr(parent_mod, s)
+                setattr(parent_mod, sub_names[-1], model.model.rotary_emb.inv_freq.clone())
+            else:
+                parent_mod = model
+                sub_names = name.split(".")
+                for s in sub_names[:-1]:
+                    parent_mod = getattr(parent_mod, s)
+                setattr(parent_mod, sub_names[-1], torch.zeros(buf.shape, dtype=buf.dtype, device=CUDA_DEVICE))
+
     meta_params = [name for name, p in model.named_parameters() if p.device.type == "meta"]
     meta_buffers = [name for name, b in model.named_buffers() if b.device.type == "meta"]
     assert len(meta_params) == 0, f"Found meta parameters: {meta_params}"
