@@ -55,7 +55,7 @@ class CPUHeadWrapper(nn.Module):
         return logits_cpu.to(orig_device)
 
 
-def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage2", lm_head_cuda: bool = False):
+def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage3" if os.path.exists("./qwen3-8b-int2-stage3") else "./qwen3-8b-int2-stage2", lm_head_cuda: bool = False):
     print("=" * 80)
     print(f"LOADING INT2 QWEN3-8B MODEL FROM: {checkpoint_dir}")
     print("=" * 80)
@@ -115,14 +115,57 @@ def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage2", lm_head_cuda
         "mlp.down_proj":    (config.intermediate_size, config.hidden_size),
     }
 
+    # Detect group sizes for linear projections from checkpoint
+    group_sizes = {}
+    index_file = os.path.join(checkpoint_dir, "model.safetensors.index.json")
+    if os.path.exists(index_file):
+        with open(index_file, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        weight_map = index_data.get("weight_map", {})
+        metadata = index_data.get("metadata", {})
+        uniform_g16 = metadata.get("uniform_g16", False)
+
+        for proj_key, (in_f, out_f) in linear_specs.items():
+            gsize_key = f"model.layers.0.{proj_key}.group_size"
+            scales_key = f"model.layers.0.{proj_key}.scales"
+            if gsize_key in weight_map:
+                shard_path = os.path.join(checkpoint_dir, weight_map[gsize_key])
+                with safe_open(shard_path, framework="pt", device="cpu") as f:
+                    group_sizes[proj_key] = int(f.get_tensor(gsize_key).item())
+            elif scales_key in weight_map:
+                shard_path = os.path.join(checkpoint_dir, weight_map[scales_key])
+                with safe_open(shard_path, framework="pt", device="cpu") as f:
+                    num_g = f.get_slice(scales_key).get_shape()[1]
+                    group_sizes[proj_key] = in_f // num_g
+            elif uniform_g16:
+                group_sizes[proj_key] = 16
+            else:
+                group_sizes[proj_key] = 16 if any(k in proj_key for k in ("q_proj", "k_proj", "v_proj", "o_proj")) else 32
+    else:
+        single_path = os.path.join(checkpoint_dir, "model.safetensors")
+        if os.path.exists(single_path):
+            with safe_open(single_path, framework="pt", device="cpu") as f:
+                f_keys = set(f.keys())
+                for proj_key, (in_f, out_f) in linear_specs.items():
+                    gsize_key = f"model.layers.0.{proj_key}.group_size"
+                    scales_key = f"model.layers.0.{proj_key}.scales"
+                    if gsize_key in f_keys:
+                        group_sizes[proj_key] = int(f.get_tensor(gsize_key).item())
+                    elif scales_key in f_keys:
+                        num_g = f.get_slice(scales_key).get_shape()[1]
+                        group_sizes[proj_key] = in_f // num_g
+                    else:
+                        group_sizes[proj_key] = 16 if any(k in proj_key for k in ("q_proj", "k_proj", "v_proj", "o_proj")) else 32
+
+    print(f"      Detected projection group sizes: {group_sizes}")
+
     num_layers = len(model.model.layers)
     for layer_idx in range(num_layers):
         layer = model.model.layers[layer_idx]
         for name, (in_f, out_f) in linear_specs.items():
             parent_name, child_name = name.split(".")
             parent_mod = getattr(layer, parent_name)
-            # Default group_size (overridden during weight loading if saved)
-            g_size = 16 if any(k in name for k in ("q_proj", "k_proj", "v_proj", "o_proj")) else 32
+            g_size = group_sizes.get(name, 16 if any(k in name for k in ("q_proj", "k_proj", "v_proj", "o_proj")) else 32)
             int2_mod = Int2GroupLinear(in_f, out_f, group_size=g_size, bias=False, device=CUDA_DEVICE)
             setattr(parent_mod, child_name, int2_mod)
 
@@ -167,6 +210,11 @@ def load_int2_model(checkpoint_dir: str = "./qwen3-8b-int2-stage2", lm_head_cuda
                         proj_mod.group_size = int(tensor.item())
                     else:
                         buf = getattr(proj_mod, buf_name)
+                        if buf.shape != tensor.shape:
+                            new_buf = torch.empty(tensor.shape, dtype=buf.dtype, device=CUDA_DEVICE)
+                            setattr(proj_mod, buf_name, new_buf)
+                            proj_mod.register_buffer(buf_name, new_buf)
+                            buf = new_buf
                         buf.copy_(tensor.to(device=CUDA_DEVICE))
                 elif "q_norm.weight" in k or "k_norm.weight" in k:
                     # Attention Q/K RMSNorms (e.g. model.layers.0.self_attn.q_norm.weight)
@@ -386,7 +434,12 @@ def generate(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="End-to-End INT2 Qwen3-8B Inference")
-    parser.add_argument("--checkpoint-dir", type=str, default="./qwen3-8b-int2-stage2", help="Path to INT2 checkpoint")
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default="./qwen3-8b-int2-stage3" if os.path.exists("./qwen3-8b-int2-stage3") else "./qwen3-8b-int2-stage2",
+        help="Path to INT2 checkpoint",
+    )
     parser.add_argument("--prompt", type=str, default="Sub-1-bit and 2-bit quantization compresses large language models by", help="Input prompt")
     parser.add_argument("--max-new-tokens", type=int, default=64, help="Tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")
