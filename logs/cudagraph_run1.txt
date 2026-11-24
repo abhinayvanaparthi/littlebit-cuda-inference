@@ -1,0 +1,81 @@
+﻿**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.14.45
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+.\run_with_msvc.bat : W1124 16:55:47.815000 25248 
+.venv\Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are 
+currently not supported in Windows or MacOs.
+At line:3 char:1
++ .\run_with_msvc.bat run_qwen3_cudagraph.py 2>&1 | Tee-Object -FilePat ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (W1124 16:55:47....ndows or MacOs.:String) [], 
+RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+CUDA Device: NVIDIA GeForce RTX 3050 Ti Laptop GPU (4.00 GB VRAM)
+Loading configuration and tokenizer from local cache (LittleBitLLM/littlebit-qwen3-8b-0.55bpw)...
+Checkpoint file: C:\Users\<user>\.cache\huggingface\hub\models--LittleBitLLM--littlebit-qwen3-8b-0.55bpw\snapshots\6b2c47aa9707e624e2e737d16d64a66be8090ae9\model.safetensors
+Instantiating Qwen3 skeleton model on meta device...
+Materialized rotary embedding on CUDA.
+Stream-loading weights and moving layers to CUDA...
+Loading embed_tokens table onto CPU (saving ~1.24 GB VRAM)...
+  Layer  6/36 loaded to CUDA | VRAM:    77.3 MB
+  Layer 12/36 loaded to CUDA | VRAM:   154.6 MB
+  Layer 18/36 loaded to CUDA | VRAM:   231.9 MB
+  Layer 24/36 loaded to CUDA | VRAM:   309.8 MB
+  Layer 30/36 loaded to CUDA | VRAM:   387.1 MB
+  Layer 36/36 loaded to CUDA | VRAM:   464.4 MB
+Placing lm_head on CUDA (1187.0 MB)...
+Assertion passed: All 36 layers (including q_norm and k_norm) and model buffers are verified loaded (0 meta tensors remain).
+
+Model loading complete! Total VRAM allocated: 1652.4 MB (1.61 GB / 4.00 GB)
+
+===========================================================================
+  Single-Layer Numerical Accuracy Check: model.layers[0].self_attn.q_proj
+===========================================================================
+  Configuration: in_features=4096, out_features=4096, split_dim=544, residual=True
+[cuda_ops] Compiling CUDA extension (first run, may take ~30s)...
+ninja: no work to do.
+<repo>\.venv\Lib\site-packages\torch\nn\modules\module.py:1787: FutureWarning: 
+`past_key_values` is deprecated and will be removed in version 5.40.0 for `Qwen3ForCausalLM.forward`. 
+Use `cache` instead.
+  return forward_call(*args, **kwargs)
+[cuda_ops] CUDA extension loaded successfully.
+  Test Tensor Shape   : (1, 16, 4096) (FP16)
+  Max Absolute Error  : 4.832268e-03
+  Mean Absolute Error : 3.995325e-04
+  Accuracy Status     : [PASSED] (threshold: 1e-2)
+===========================================================================
+
+
+===========================================================================
+  LittleBit Qwen3-8B CUDA-Graph Accelerated Generation Benchmark
+===========================================================================
+Direct Completion Prompt:
+  'Sub-1-bit quantization compresses large language models by'
+
+Prompt length: 12 tokens
+Initializing StaticCache(max_cache_len=512)...
+Running prefill pass...
+Warming up decode pass 3x on side stream for CUDA Graph capture...
+Capturing decode pass into torch.cuda.CUDAGraph()...
+CUDA Graph capture successful!
+
+===========================================================================
+  CUDA Graph Benchmark Results:
+===========================================================================
+  1. Peak VRAM Allocated       :   1750.2 MB  (1.71 GB / 4.00 GB)
+  2. Prefill Time              :   542.45 ms
+  3. CUDA-Graphed Decode Speed :    26.65 tokens/sec (96 tokens in 3.565 s)
+  4. Sampling Parameters       : temp=0.7, top_p=0.9, rep_penalty=1.18
+===========================================================================
+
+Generated Text Output:
+
+---------------------------------------------------------------------------
+Sub-1-bit quantization compresses large language models by using the domain tree technique. The goal of this paper is to find out if a string of 500 words with different grammatical components can be compressed into one word, and then analyze whether these sentences could be interpreted as semantic expressions.
+
+Keywords: sentence structure analysis, compression techniques for text processing.
+The results from our experiments show that compressed sentences may have significant structural properties. We first use the term "sentence structure" in an earlier work on sentence structures ( see [2
+---------------------------------------------------------------------------

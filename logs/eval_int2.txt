@@ -1,0 +1,74 @@
+﻿**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.14.45
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+.\run_with_msvc.bat : W1124 16:56:32.010000 22380 .venv\Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] 
+NOTE: Redirects are currently not supported in Windows or MacOs.
+At line:5 char:1
++ .\run_with_msvc.bat eval_int2.py 2>&1 | Tee-Object -FilePath logs\eva ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (W1124 16:56:32....ndows or MacOs.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+================================================================================
+LOADING INT2 QWEN3-8B MODEL FROM: ./qwen3-8b-int2-stage3
+================================================================================
+
+[1/4] Instantiating Qwen3-8B skeleton on meta device...
+      Materialized Qwen3RotaryEmbedding on cuda:0 (inv_freq[:3] = [1.0, 0.8058, 0.6494], last = 1.2409e-06)
+[2/4] Replacing linear projections with Int2GroupLinear modules...
+      Detected projection group sizes: {'self_attn.q_proj': 16, 'self_attn.k_proj': 16, 'self_attn.v_proj': 16, 'self_attn.o_proj': 16, 'mlp.gate_proj': 16, 'mlp.up_proj': 16, 'mlp.down_proj': 16}
+[3/4] Streaming weights from safetensors into CUDA buffers and CPU wrappers...
+[4/4] Verifying 0 meta tensors, embeddings/head wrappers, and weight tying...
+      Verified tie_word_embeddings=False: separate memory pointers (0x1d9b0e77290 vs 0x1da7ecc3a30)
+      Verified CPUEmbeddingWrapper: input (1, 2) -> output (1, 2, 4096) (torch.float16) on cuda:0
+      Verified CPUHeadWrapper: input (1, 2, 4096) -> output (1, 2, 151936) (torch.float16) on cuda:0
+      Model fully loaded! Total GPU VRAM Allocated: 3312.6 MB (3.23 GB / 4.00 GB)
+
+[1] Q: Explain the difference between a CPU and a GPU in 3 short bullet points.
+[transformers] `past_key_values`/`cache_params` are deprecated. Use `cache` instead.
+<repo>\.venv\Lib\site-packages\torch\nn\modules\module.py:1787: FutureWarning: `past_key_values` is deprecated 
+and will be removed in version 5.40.0 for `Qwen3ForCausalLM.forward`. Use `cache` instead.
+  return forward_call(*args, **kwargs)
+    A: - **CPU** is designed for general-purpose computing, with a single core that handles sequential tasks efficiently.
+- **GPU** is specialized for parallel processing, using many cores to handle complex calculations simultaneously.
+- CPUs are better for sequential tasks like software development, while GPUs excel in parallel tasks such as AI training or rendering.
+
+The differences can be summarized as follows:
+- **Purpose**: CPUs focus on sequential execution; GPUs optimize parallel computation.
+- **Architecture: CPUs use fewer cores but higher clock speeds, while GPUs have thousands of cores optimized for parallelism.
+- **Use Cases: CPUs manage everyday tasks, while GPUs tackle high-performance applications requiring massive data processing.
+    (132 tokens in 23.1s -> 5.71 tok/s)
+----------------------------------------------------------------------
+
+[2] Q: Write a Python function to check if a word is a palindrome, and give one example.
+    A: Here's a Python function that checks whether a word is a palindrome:
+
+```python
+def is_palindrome(word):
+    return word == word[::-1]
+
+# Example usage:
+word = 'racecar'
+print(is_palindrome(word))  # returns True for 'racecar' as it is the same when reversed.
+```
+
+Example: 
+LetÆs say we want to check if "racecar" is a palindrome.
+
+The function `is_palindrome` will compare the string with its reverse. If they are equal, then it's a palindrome. So in this case, the function would return True because "racecar" can be reversed into "racecar".
+
+So, the code would output True for the input "racecar", which means it is indeed a palindrome. 
+
+This shows that
+    (160 tokens in 26.6s -> 6.01 tok/s)
+----------------------------------------------------------------------
+
+[3] Q: A farmer has 17 sheep. All but 9 run away. How many sheep does the farmer have left? Explain briefly.
+    A: The farmer has 17 sheep. If all but 9 run away, that means 17 - 9 = 8 remain (since "all but" implies that only 9 are running). So, the number of sheep remaining is 8.
+
+Therefore, the answer is 8.
+    (61 tokens in 11.8s -> 5.18 tok/s)
+----------------------------------------------------------------------
+Peak VRAM: 3.28 GB / 4.00 GB

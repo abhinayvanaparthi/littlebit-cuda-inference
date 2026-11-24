@@ -24,8 +24,13 @@ __pycache__/
 .env
 .hf_cache/
 .cache/
+qwen3-8b-int2-*/
 qwen3-8b-int2-stage2/
 qwen3-8b-int2-stage3/
+
+# Standalone model weight files
+*.safetensors
+*.bin
 
 # Cloned reference repository
 LittleBit/
